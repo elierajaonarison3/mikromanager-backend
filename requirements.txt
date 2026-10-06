@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 psycopg[binary]
 sqlalchemy
-routeros-api
+librouteros
 pydantic
 requests
 python-dotenv
