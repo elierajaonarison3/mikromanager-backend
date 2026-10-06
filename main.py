@@ -1,4 +1,5 @@
 from multiprocessing import connection
+import os
 from fastapi import FastAPI
 from sqlalchemy import text
 import socket
@@ -3308,3 +3309,30 @@ def mikrotik_monitoring():
             api.close()
         except:
             pass
+from fastapi import Request
+from datetime import datetime
+import secrets
+
+AGENT_TOKEN =os.getenv("MIKROTIK_AGENT_TOKEN", "")
+
+def verifier_agent(request: Request):
+    token = request.headers.get("X-MikroManager-Token")
+
+    if not AGENT_TOKEN or token != AGENT_TOKEN:
+        return False
+
+    return True
+
+@app.get("/mikrotik/agent/test")
+def agent_test(request: Request):
+    if not verifier_agent(request):
+        return {
+            "status": "error",
+            "message": "Unauthorized"
+        }
+
+    return {
+        "status": "success",
+        "message": "MikroTik Agent connected",
+        "time": datetime.now().isoformat()
+    }
