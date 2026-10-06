@@ -3350,3 +3350,20 @@ def agent_heartbeat(request: Request):
         "message": "MikroTik heartbeat received",
         "time": datetime.now().isoformat()
     }
+
+@app.post("/mikrotik/agent/report")
+def agent_report(request: Request, data: dict):
+    if not verifier_agent(request):
+        return {
+            "status": "error",
+            "message": "Unauthorized"
+        }
+
+    devices = data.get("devices", [])
+
+    return {
+        "status": "success",
+        "message": "MikroTik report received",
+        "devices_received": len(devices),
+        "time": datetime.now().isoformat()
+    }
