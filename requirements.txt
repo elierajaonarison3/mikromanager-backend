@@ -5,3 +5,4 @@ sqlalchemy
 routeros-api
 pydantic
 requests
+python-dotenv
