@@ -3336,3 +3336,17 @@ def agent_test(request: Request):
         "message": "MikroTik Agent connected",
         "time": datetime.now().isoformat()
     }
+
+@app.post("/mikrotik/agent/heartbeat")
+def agent_heartbeat(request: Request):
+    if not verifier_agent(request):
+        return {
+            "status": "error",
+            "message": "Unauthorized"
+        }
+
+    return {
+        "status": "success",
+        "message": "MikroTik heartbeat received",
+        "time": datetime.now().isoformat()
+    }
