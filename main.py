@@ -1,3 +1,4 @@
+import json
 from multiprocessing import connection
 import os
 from fastapi import FastAPI
@@ -69,6 +70,20 @@ def initialiser_tables_notifications():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(mac, traffic_date)
             )
+        """))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS mikromanager_agent_commands (
+                id SERIAL PRIMARY KEY,
+                command_type VARCHAR(100) NOT NULL,
+                command_data TEXT NOT NULL,
+                status VARCHAR(30) DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                executed_at TIMESTAMP
+            )
+        """))
+        connection.execute(text("""
+            ALTER TABLE mikromanager_agent_commands
+            ADD COLUMN IF NOT EXISTS result_data TEXT
         """))
  
 def verifier_connexions_appareils():
@@ -3359,11 +3374,305 @@ def agent_report(request: Request, data: dict):
             "message": "Unauthorized"
         }
 
-    devices = data.get("devices", [])
+    try:
+        devices = data.get("devices", [])
 
-    return {
-        "status": "success",
-        "message": "MikroTik report received",
-        "devices_received": len(devices),
-        "time": datetime.now().isoformat()
-    }
+        with engine.begin() as connection:
+
+            for device in devices:
+                mac = str(
+                    device.get("mac", "")
+                ).strip().upper()
+
+                if not mac:
+                    continue
+
+                ip = device.get("ip")
+                hostname = (
+                    device.get("hostname")
+                    or "Appareil inconnu"
+                )
+
+                connected = bool(
+                    device.get("connected", False)
+                )
+
+                existing = connection.execute(
+                    text("""
+                        SELECT id
+                        FROM mikromanager_known_devices
+                        WHERE mac = :mac
+                        LIMIT 1
+                    """),
+                    {
+                        "mac": mac
+                    }
+                ).fetchone()
+
+                if existing:
+
+                    connection.execute(
+                        text("""
+                            UPDATE mikromanager_known_devices
+                            SET
+                                ip = :ip,
+                                hostname = :hostname,
+                                is_connected = :is_connected
+                            WHERE mac = :mac
+                        """),
+                        {
+                            "mac": mac,
+                            "ip": ip,
+                            "hostname": hostname,
+                            "is_connected": connected
+                        }
+                    )
+
+                else:
+
+                    connection.execute(
+                        text("""
+                            INSERT INTO mikromanager_known_devices
+                            (
+                                mac,
+                                ip,
+                                hostname,
+                                is_connected
+                            )
+                            VALUES
+                            (
+                                :mac,
+                                :ip,
+                                :hostname,
+                                :is_connected
+                            )
+                        """),
+                        {
+                            "mac": mac,
+                            "ip": ip,
+                            "hostname": hostname,
+                            "is_connected": connected
+                        }
+                    )
+
+        return {
+            "status": "success",
+            "message": "MikroTik report enregistré",
+            "devices_received": len(devices),
+            "time": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "message": str(e),
+            "type": type(e).__name__
+        }
+        
+@app.get("/mikrotik/agent/poll")
+def agent_poll(request: Request):
+
+
+    if not verifier_agent(request):
+        return {
+            "status": "error",
+            "message": "Unauthorized"
+        }
+
+    try:
+
+        with engine.begin() as connection:
+
+            commands = connection.execute(
+                text("""
+                    WITH selected AS (
+                        SELECT id
+                        FROM mikromanager_agent_commands
+                        WHERE status = 'pending'
+                        ORDER BY id ASC
+                        LIMIT 10
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE mikromanager_agent_commands
+                    SET status = 'processing'
+                    WHERE id IN (
+                        SELECT id FROM selected
+                    )
+                    RETURNING
+                        id,
+                        command_type,
+                        command_data,
+                        created_at
+                """)
+            ).mappings().all()
+
+            result = []
+
+            for command in commands:
+
+                item = dict(command)
+
+                if item.get("created_at"):
+                    item["created_at"] = (
+                        item["created_at"].isoformat()
+                    )
+
+                result.append(item)
+
+        return {
+            "status": "success",
+            "commands": result
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "message": str(e),
+            "type": type(e).__name__
+        }
+
+        
+@app.post("/mikrotik/agent/command")
+def create_agent_command(
+    request: Request,
+    data: dict
+):
+
+    if not verifier_agent(request):
+        return {
+            "status": "error",
+            "message": "Unauthorized"
+        }
+
+    command_type = str(
+        data.get("command_type", "")
+    ).strip()
+
+    command_data = data.get(
+        "command_data",
+        {}
+    )
+
+    if not command_type:
+        return {
+            "status": "error",
+            "message": "command_type manquant"
+        }
+
+    try:
+
+        with engine.begin() as connection:
+
+            result = connection.execute(
+                text("""
+                    INSERT INTO mikromanager_agent_commands
+                    (
+                        command_type,
+                        command_data,
+                        status
+                    )
+                    VALUES
+                    (
+                        :command_type,
+                        :command_data,
+                        'pending'
+                    )
+                    RETURNING id
+                """),
+                {
+                    "command_type": command_type,
+                    "command_data": json.dumps(
+                        command_data,
+                        ensure_ascii=False
+                    )
+                }
+            ).mappings().first()
+
+        return {
+            "status": "success",
+            "message": "Commande enregistrée",
+            "command_id": result["id"]
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "message": str(e),
+            "type": type(e).__name__
+        }
+@app.post("/mikrotik/agent/result")
+def agent_result(
+    request: Request,
+    data: dict
+):
+
+    if not verifier_agent(request):
+        return {
+            "status": "error",
+            "message": "Unauthorized"
+        }
+
+    command_id = data.get("command_id")
+    command_status = data.get("status")
+    result_data = data.get("result", {})
+
+    if not command_id:
+        return {
+            "status": "error",
+            "message": "command_id manquant"
+        }
+
+    if command_status not in ["executed", "failed"]:
+        return {
+            "status": "error",
+            "message": "Statut invalide"
+        }
+
+    try:
+
+        import json
+
+        with engine.begin() as connection:
+
+            result = connection.execute(
+                text("""
+                    UPDATE mikromanager_agent_commands
+                    SET
+                        status = :status,
+                        result_data = :result_data,
+                        executed_at = CURRENT_TIMESTAMP
+                    WHERE id = :id
+                    AND status = 'processing'
+                    RETURNING id
+                """),
+                {
+                    "id": command_id,
+                    "status": command_status,
+                    "result_data": json.dumps(
+                        result_data,
+                        ensure_ascii=False
+                    )
+                }
+            ).first()
+
+        if not result:
+            return {
+                "status": "error",
+                "message": "Commande introuvable ou non disponible"
+            }
+
+        return {
+            "status": "success",
+            "message": "Résultat enregistré",
+            "command_id": command_id
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "message": str(e)
+        }
