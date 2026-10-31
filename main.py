@@ -1404,140 +1404,77 @@ def create_test_queue():
     finally:
         api.close()
 
+def enqueue_agent_command(command_type: str, command_data: dict):
+    import json
+
+    try:
+        with engine.begin() as connection:
+            result = connection.execute(
+                text("""
+                    INSERT INTO mikromanager_agent_commands
+                    (command_type, command_data, status)
+                    VALUES (:command_type, :command_data, 'pending')
+                    RETURNING id
+                """),
+                {
+                    "command_type": command_type,
+                    "command_data": json.dumps(command_data)
+                }
+            ).first()
+
+        return {
+            "status": "success",
+            "message": "Commande envoyée au MikroTik Agent",
+            "command_id": result[0],
+            "queued": True
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 @app.put("/mikrotik/devices/{ip}/limit")
-def limit_device(
-    ip: str,
-    request: LimitRequest
-):
-    api = connexion_mikrotik()
-
-    if api is None:
-        return {
-            "status": "error",
-            "message": "Connexion MikroTik échouée"
-        }
+def limit_device(ip: str, request: LimitRequest):
+    import ipaddress
 
     try:
-        queues = api.path(
-            "queue",
-            "simple"
-        )
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return {"status": "error", "message": "IP invalide"}
 
-        queue_list = list(queues)
+    download = request.download
+    upload = request.upload
 
-        target = f"{ip}/32"
-
-        queue = None
-
-        for item in queue_list:
-
-            if item.get("target") == target:
-                queue = item
-                break
-
-        if queue is None:
-
-            return {
-                "status": "error",
-                "message": f"Aucune queue trouvée pour {ip}"
-            }
-
-        download = request.download
-        upload = request.upload
-
-        if download <= 0 or upload <= 0:
-
-            return {
-                "status": "error",
-                "message": "La limite doit être supérieure à 0 Mbps"
-            }
-
-        queues.update(
-            **{
-                ".id": queue[".id"],
-                "max-limit": f"{upload}M/{download}M"
-            }
-        )
-
-        return {
-            "status": "success",
-            "message": "Limite de débit mise à jour",
-            "ip": ip,
-            "download": f"{download} Mbps",
-            "upload": f"{upload} Mbps"
-        }
-
-    except Exception as e:
-
+    if download <= 0 or upload <= 0:
         return {
             "status": "error",
-            "message": str(e)
+            "message": "La limite doit être supérieure à 0"
         }
 
-    finally:
-        api.close()
-
-
+    return enqueue_agent_command(
+        "limit",
+        {
+            "ip": ip,
+            "download": download,
+            "upload": upload
+        }
+    )
 @app.put("/mikrotik/devices/{ip}/block")
 def block_device(ip: str):
-    api = connexion_mikrotik()
-
-    if api is None:
-        return {
-            "status": "error",
-            "message": "Connexion MikroTik échouée"
-        }
+    import ipaddress
 
     try:
-        queues = api.path(
-            "queue",
-            "simple"
-        )
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return {"status": "error", "message": "IP invalide"}
 
-        queue_list = list(queues)
-
-        target = f"{ip}/32"
-
-        queue = None
-
-        for item in queue_list:
-
-            if item.get("target") == target:
-                queue = item
-                break
-
-        if queue is None:
-
-            return {
-                "status": "error",
-                "message": f"Aucune queue trouvée pour {ip}"
-            }
-
-        queues.update(
-            **{
-                ".id": queue[".id"],
-                "max-limit": "1/1"
-            }
-        )
-
-        return {
-            "status": "success",
-            "message": "Internet bloqué",
-            "ip": ip
-        }
-
-    except Exception as e:
-
-        return {
-            "status": "error",
-            "message": str(e)
-        }
-
-    finally:
-        api.close()
-
-
+    return enqueue_agent_command(
+        "block",
+        {"ip": ip}
+    )
+    
 @app.put("/mikrotik/devices/{ip}/firewall-block")
 def firewall_block_device(ip: str):
     api = connexion_mikrotik()
@@ -1630,62 +1567,17 @@ def firewall_block_device(ip: str):
 
 @app.put("/mikrotik/devices/{ip}/unblock")
 def unblock_device(ip: str):
-    api = connexion_mikrotik()
-
-    if api is None:
-        return {
-            "status": "error",
-            "message": "Connexion MikroTik échouée"
-        }
+    import ipaddress
 
     try:
-        queues = api.path(
-            "queue",
-            "simple"
-        )
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return {"status": "error", "message": "IP invalide"}
 
-        queue_list = list(queues)
-
-        target = f"{ip}/32"
-
-        queue = None
-
-        for item in queue_list:
-
-            if item.get("target") == target:
-                queue = item
-                break
-
-        if queue is None:
-
-            return {
-                "status": "error",
-                "message": f"Aucune queue trouvée pour {ip}"
-            }
-
-        queues.update(
-            **{
-                ".id": queue[".id"],
-                "max-limit": "1000M/1000M"
-            }
-        )
-
-        return {
-            "status": "success",
-            "message": "Internet débloqué",
-            "ip": ip
-        }
-
-    except Exception as e:
-
-        return {
-            "status": "error",
-            "message": str(e)
-        }
-
-    finally:
-        api.close()
-
+    return enqueue_agent_command(
+        "unblock",
+        {"ip": ip}
+    )
 
 @app.put("/mikrotik/devices/{ip}/firewall-unblock")
 def firewall_unblock_device(ip: str):
@@ -3676,3 +3568,52 @@ def agent_result(
             "status": "error",
             "message": str(e)
         }
+
+@app.get("/mikrotik/agent/poll-ros")
+def agent_poll_ros(request: Request):
+    import json
+    import ipaddress
+    from fastapi.responses import PlainTextResponse
+
+    if not verifier_agent(request):
+        return PlainTextResponse("UNAUTHORIZED")
+
+    try:
+        with engine.begin() as connection:
+            command = connection.execute(
+                text("""
+                    WITH selected AS (
+                        SELECT id
+                        FROM mikromanager_agent_commands
+                        WHERE status = 'pending'
+                        ORDER BY id ASC
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE mikromanager_agent_commands
+                    SET status = 'processing'
+                    WHERE id IN (SELECT id FROM selected)
+                    RETURNING id, command_type, command_data
+                """)
+            ).mappings().first()
+
+        if not command:
+            return PlainTextResponse("EMPTY")
+
+        data = json.loads(command["command_data"])
+
+        command_type = command["command_type"]
+        ip = str(ipaddress.ip_address(data["ip"]))
+
+        download = data.get("download", 0)
+        upload = data.get("upload", 0)
+
+        if command_type not in ["block", "unblock", "limit"]:
+            return PlainTextResponse("INVALID")
+
+        return PlainTextResponse(
+            f'{command["id"]}|{command_type}|{ip}|{download}|{upload}'
+        )
+
+    except Exception:
+        return PlainTextResponse("ERROR")
