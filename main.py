@@ -3257,9 +3257,9 @@ def agent_heartbeat(request: Request):
         "message": "MikroTik heartbeat received",
         "time": datetime.now().isoformat()
     }
-
 @app.post("/mikrotik/agent/report")
 def agent_report(request: Request, data: dict):
+
     if not verifier_agent(request):
         return {
             "status": "error",
@@ -3271,7 +3271,29 @@ def agent_report(request: Request, data: dict):
 
         with engine.begin() as connection:
 
+            # TABLE HITAHIRIZANA NY RAPPORT COMPLET
+            connection.execute(text("""
+                CREATE TABLE IF NOT EXISTS mikromanager_agent_reports (
+                    id SERIAL PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+
+            # MITAHIRY NY RAPPORT REHETRA
+            connection.execute(
+                text("""
+                    INSERT INTO mikromanager_agent_reports (payload)
+                    VALUES (CAST(:payload AS JSONB))
+                """),
+                {
+                    "payload": json.dumps(data)
+                }
+            )
+
+            # MITAHIRY NY APPAREILS
             for device in devices:
+
                 mac = str(
                     device.get("mac", "")
                 ).strip().upper()
@@ -3280,6 +3302,7 @@ def agent_report(request: Request, data: dict):
                     continue
 
                 ip = device.get("ip")
+
                 hostname = (
                     device.get("hostname")
                     or "Appareil inconnu"
@@ -3296,9 +3319,7 @@ def agent_report(request: Request, data: dict):
                         WHERE mac = :mac
                         LIMIT 1
                     """),
-                    {
-                        "mac": mac
-                    }
+                    {"mac": mac}
                 ).fetchone()
 
                 if existing:
@@ -3351,6 +3372,7 @@ def agent_report(request: Request, data: dict):
             "status": "success",
             "message": "MikroTik report enregistré",
             "devices_received": len(devices),
+            "report_saved": True,
             "time": datetime.now().isoformat()
         }
 
@@ -3361,7 +3383,7 @@ def agent_report(request: Request, data: dict):
             "message": str(e),
             "type": type(e).__name__
         }
-        
+
 @app.get("/mikrotik/agent/poll")
 def agent_poll(request: Request):
 
@@ -3616,4 +3638,4 @@ def agent_poll_ros(request: Request):
         )
 
     except Exception:
-        return PlainTextResponse("ERROR")
+        return PlainTextResponse("ERROR") 
