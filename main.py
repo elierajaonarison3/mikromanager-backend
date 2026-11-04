@@ -1392,6 +1392,32 @@ def get_notifications():
             "message": str(e)
         }
 
+@app.get("/mikrotik/notifications/test")
+def creer_notification_test():
+    """Crée une notification de test pour vérifier l'affichage dans l'app."""
+    try:
+        with engine.begin() as connection:
+            ajouter_notification(
+                connection,
+                "test",
+                "Notification de test",
+                "Si vous voyez ceci, l'affichage des notifications fonctionne.",
+                None, None, None
+            )
+
+        return {
+            "status": "success",
+            "message": "Notification de test créée"
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "type": type(e).__name__
+        }
+
+
 @app.put("/mikrotik/notifications/{notification_id}/read")
 def mark_notification_as_read(notification_id: int):
     try:
@@ -2229,8 +2255,14 @@ def enrichir_avec_queues(devices, payload):
         device["download_bytes"] = download
         device["upload_formatted"] = format_octets(upload)
         device["download_formatted"] = format_octets(download)
+        device["has_queue"] = paire is not None
 
-        if not device.get("total_bytes"):
+        # octets vus uniquement sur les connexions analysées (partiel)
+        device["sites_bytes"] = device.get("total_bytes", 0)
+
+        # Le vrai total vient de la Simple Queue quand elle existe ;
+        # sinon on garde la valeur partielle des connexions.
+        if paire is not None:
             device["total_bytes"] = upload + download
             device["total_formatted"] = format_octets(upload + download)
 
