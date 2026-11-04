@@ -1,7 +1,8 @@
 import json
-from multiprocessing import connection
 import os
-from fastapi import FastAPI
+import secrets
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 import socket
 import hashlib
@@ -16,6 +17,43 @@ app = FastAPI(
     title="MikroManager API",
     version="1.0.0"
 )
+
+ADMIN_TOKEN = os.getenv("MIKROMANAGER_ADMIN_TOKEN", "")
+
+if not ADMIN_TOKEN:
+    print(
+        "ATTENTION : MIKROMANAGER_ADMIN_TOKEN non défini, "
+        "les endpoints d'administration ne sont PAS protégés."
+    )
+
+
+@app.middleware("http")
+async def proteger_endpoints_admin(request: Request, call_next):
+    """
+    Protège tous les endpoints /mikrotik/* (sauf /mikrotik/agent/*, qui ont
+    leur propre token) avec l'en-tête X-MikroManager-Admin-Token.
+    Inactif tant que MIKROMANAGER_ADMIN_TOKEN n'est pas défini.
+    """
+    path = request.url.path
+
+    if (
+        ADMIN_TOKEN
+        and request.method != "OPTIONS"
+        and path.startswith("/mikrotik/")
+        and not path.startswith("/mikrotik/agent/")
+    ):
+        token = request.headers.get("X-MikroManager-Admin-Token", "")
+
+        if not secrets.compare_digest(
+            token.encode(), ADMIN_TOKEN.encode()
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"status": "error", "message": "Unauthorized"}
+            )
+
+    return await call_next(request)
+
 
 SITE_REFRESH_INTERVAL = 300
 
@@ -84,6 +122,17 @@ def initialiser_tables_notifications():
         connection.execute(text("""
             ALTER TABLE mikromanager_agent_commands
             ADD COLUMN IF NOT EXISTS result_data TEXT
+        """))
+        connection.execute(text("""
+            ALTER TABLE mikromanager_agent_commands
+            ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP
+        """))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS mikromanager_agent_reports (
+                id SERIAL PRIMARY KEY,
+                payload JSONB NOT NULL,
+                received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
         """))
  
 def verifier_connexions_appareils():
@@ -526,7 +575,7 @@ def verifier_consommation_quotidienne():
                         {
                             "message": (
                                 f"{hostname} a dépassé "
-                                f"2 GB de consommation aujourd'hui "
+                                f"{DAILY_TRAFFIC_LIMIT / (1024 ** 3):g} GB de consommation aujourd'hui "
                                 f"({total_gb:.2f} GB)."
                             ),
                             "mac": mac,
@@ -758,35 +807,14 @@ def verifier_nouveaux_appareils():
 
     finally:
         api.close()
-        
+
 def boucle_verification_notifications():
-    print("Service automatique des notifications démarré")
+    print("Service notifications en mode Agent démarré")
 
     while True:
         try:
-            nouvelles_notifications = verifier_nouveaux_appareils()
-
-            if nouvelles_notifications:
-                print(
-                    "Nouveaux appareils détectés :",
-                    len(nouvelles_notifications)
-                )
-
-            connexions_notifications = verifier_connexions_appareils()
-
-            if connexions_notifications:
-                print(
-                    "Changements de connexion détectés :",
-                    len(connexions_notifications)
-                )
-
-            traffic_notifications = verifier_consommation_quotidienne()
-
-            if traffic_notifications:
-                print(
-                    "Limites de consommation détectées :",
-                    len(traffic_notifications)
-                )
+            # Les notifications seront traitées lors des rapports Agent.
+            time.sleep(NOTIFICATION_CHECK_INTERVAL)
 
         except Exception as e:
             print(
@@ -794,7 +822,8 @@ def boucle_verification_notifications():
                 repr(e)
             )
 
-        time.sleep(NOTIFICATION_CHECK_INTERVAL)
+            time.sleep(NOTIFICATION_CHECK_INTERVAL)        
+
 class LimitRequest(BaseModel):
     download: int
     upload: int
@@ -1178,7 +1207,6 @@ def mikrotik_dhcp_leases():
 
 @app.get("/mikrotik/notifications")
 def get_notifications():
-    nouvelles_notifications = verifier_nouveaux_appareils()
 
     try:
         with engine.connect() as connection:
@@ -1204,24 +1232,22 @@ def get_notifications():
             result = []
 
             for notification in notifications:
-
                 item = dict(notification)
 
                 if item.get("created_at"):
-                    item["created_at"] = (
-                        item["created_at"].isoformat()
-                    )
+                    item["created_at"] = item["created_at"].isoformat()
 
                 result.append(item)
 
             return {
                 "status": "success",
-                "new_detected": len(nouvelles_notifications),
+                "new_detected": 0,
                 "total_unread": len(result),
                 "notifications": result
             }
 
     except Exception as e:
+        print("ERREUR NOTIFICATIONS =", repr(e))
 
         return {
             "status": "error",
@@ -1857,19 +1883,6 @@ def nettoyer_nom_site(domain):
 
 
 
-def nettoyer_nom_site(domain):
-    if not domain:
-        return None
-
-    domain = str(domain).strip().lower()
-
-    if domain.endswith("."):
-        domain = domain[:-1]
-
-    if domain.startswith("www."):
-        domain = domain[4:]
-
-    return domain
 
 
 def nom_site_depuis_domaine(domain):
@@ -2001,8 +2014,51 @@ def format_octets(octets):
     return f"{octets / (1024 * 1024 * 1024):.2f} GB"
 
 
-def obtenir_sites_detectes(api):
+def _premiere_liste(payload, *cles):
+    for cle in cles:
+        valeur = payload.get(cle)
+
+        if isinstance(valeur, list) and valeur:
+            return [v for v in valeur if isinstance(v, dict)]
+
+    return []
+
+
+def obtenir_sites_detectes(payload):
+    """
+    Analyse un rapport de l'agent MikroTik (dict JSON).
+    Clés acceptées : leases / dhcp_leases, dns_cache / dns, connections.
+    Si 'leases' est absent, on reconstruit les baux depuis 'devices'.
+    """
     appareils = {}
+    payload = payload or {}
+
+    leases = _premiere_liste(
+        payload, "leases", "dhcp_leases", "dhcp-leases", "dhcp"
+    )
+
+    if not leases:
+        leases = [
+            {
+                "address": d.get("ip"),
+                "mac-address": d.get("mac"),
+                "host-name": d.get("hostname"),
+                "status": "bound" if d.get("connected") else "waiting",
+                "active-address": (
+                    d.get("ip") if d.get("connected") else None
+                )
+            }
+            for d in payload.get("devices", [])
+            if isinstance(d, dict)
+        ]
+
+    dns_cache = _premiere_liste(
+        payload, "dns_cache", "dns-cache", "dns"
+    )
+
+    connections = _premiere_liste(
+        payload, "connections", "firewall_connections", "conntrack"
+    )
 
     for lease in leases:
 
@@ -3109,19 +3165,72 @@ def mikrotik_monitoring():
             "type": type(e).__name__
         }        
         
-from fastapi import Request
-from datetime import datetime
-import secrets
-
-AGENT_TOKEN =os.getenv("MIKROTIK_AGENT_TOKEN", "")
+AGENT_TOKEN = os.getenv("MIKROTIK_AGENT_TOKEN", "")
 
 def verifier_agent(request: Request):
-    token = request.headers.get("X-MikroManager-Token")
+    token = request.headers.get("X-MikroManager-Token") or ""
 
-    if not AGENT_TOKEN or token != AGENT_TOKEN:
+    if not AGENT_TOKEN:
         return False
 
-    return True
+    return secrets.compare_digest(
+        token.encode(), AGENT_TOKEN.encode()
+    )
+
+
+def ajouter_notification(
+    connection, type_, title, message, mac, ip, hostname
+):
+    connection.execute(
+        text("""
+            INSERT INTO mikromanager_notifications
+                (type, title, message, mac, ip, hostname)
+            VALUES
+                (:type, :title, :message, :mac, :ip, :hostname)
+        """),
+        {
+            "type": type_,
+            "title": title,
+            "message": message,
+            "mac": mac,
+            "ip": ip,
+            "hostname": hostname
+        }
+    )
+
+
+def liberer_commandes_bloquees(minutes: int = 5):
+    """Remet en 'pending' les commandes restées en 'processing' trop longtemps."""
+    with engine.begin() as connection:
+        connection.execute(
+            text("""
+                UPDATE mikromanager_agent_commands
+                SET status = 'pending', claimed_at = NULL
+                WHERE status = 'processing'
+                AND COALESCE(claimed_at, created_at)
+                    < CURRENT_TIMESTAMP - (:minutes * INTERVAL '1 minute')
+            """),
+            {"minutes": minutes}
+        )
+
+
+def marquer_commande_echouee(command_id: int, raison: str):
+    with engine.begin() as connection:
+        connection.execute(
+            text("""
+                UPDATE mikromanager_agent_commands
+                SET status = 'failed',
+                    result_data = :result_data,
+                    executed_at = CURRENT_TIMESTAMP
+                WHERE id = :id
+            """),
+            {
+                "id": command_id,
+                "result_data": json.dumps(
+                    {"error": raison}, ensure_ascii=False
+                )
+            }
+        )
 
 @app.get("/mikrotik/agent/test")
 def agent_test(request: Request):
@@ -3164,101 +3273,90 @@ def agent_report(request: Request, data: dict):
 
         with engine.begin() as connection:
 
-            # TABLE HITAHIRIZANA NY RAPPORT COMPLET
-            connection.execute(text("""
-                CREATE TABLE IF NOT EXISTS mikromanager_agent_reports (
-                    id SERIAL PRIMARY KEY,
-                    payload JSONB NOT NULL,
-                    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """))
-
-            # MITAHIRY NY RAPPORT REHETRA
+            # Sauvegarde du rapport complet
             connection.execute(
                 text("""
                     INSERT INTO mikromanager_agent_reports (payload)
                     VALUES (CAST(:payload AS JSONB))
                 """),
-                {
-                    "payload": json.dumps(data)
-                }
+                {"payload": json.dumps(data)}
             )
 
-            # MITAHIRY NY APPAREILS
+            # Nettoyage des anciens rapports (7 jours)
+            connection.execute(text("""
+                DELETE FROM mikromanager_agent_reports
+                WHERE received_at < CURRENT_TIMESTAMP - INTERVAL '7 days'
+            """))
+
+            # Appareils + notifications
             for device in devices:
 
-                mac = str(
-                    device.get("mac", "")
-                ).strip().upper()
+                if not isinstance(device, dict):
+                    continue
+
+                mac = str(device.get("mac", "")).strip().upper()
 
                 if not mac:
                     continue
 
                 ip = device.get("ip")
+                hostname = device.get("hostname") or "Appareil inconnu"
+                connected = bool(device.get("connected", False))
 
-                hostname = (
-                    device.get("hostname")
-                    or "Appareil inconnu"
-                )
-
-                connected = bool(
-                    device.get("connected", False)
-                )
-
-                existing = connection.execute(
+                previous = connection.execute(
                     text("""
-                        SELECT id
+                        SELECT is_connected
                         FROM mikromanager_known_devices
                         WHERE mac = :mac
-                        LIMIT 1
                     """),
                     {"mac": mac}
-                ).fetchone()
+                ).mappings().first()
 
-                if existing:
+                connection.execute(
+                    text("""
+                        INSERT INTO mikromanager_known_devices
+                            (mac, ip, hostname, is_connected)
+                        VALUES
+                            (:mac, :ip, :hostname, :is_connected)
+                        ON CONFLICT (mac) DO UPDATE SET
+                            ip = EXCLUDED.ip,
+                            hostname = EXCLUDED.hostname,
+                            is_connected = EXCLUDED.is_connected
+                    """),
+                    {
+                        "mac": mac,
+                        "ip": ip,
+                        "hostname": hostname,
+                        "is_connected": connected
+                    }
+                )
 
-                    connection.execute(
-                        text("""
-                            UPDATE mikromanager_known_devices
-                            SET
-                                ip = :ip,
-                                hostname = :hostname,
-                                is_connected = :is_connected
-                            WHERE mac = :mac
-                        """),
-                        {
-                            "mac": mac,
-                            "ip": ip,
-                            "hostname": hostname,
-                            "is_connected": connected
-                        }
+                if previous is None:
+                    if connected:
+                        ajouter_notification(
+                            connection,
+                            "new_device",
+                            "Nouvel appareil détecté",
+                            f"Nouvel appareil connecté : {hostname} ({ip})",
+                            mac, ip, hostname
+                        )
+
+                elif connected and not bool(previous["is_connected"]):
+                    ajouter_notification(
+                        connection,
+                        "device_connected",
+                        "Appareil connecté",
+                        f"{hostname} ({ip}) vient de se connecter au réseau.",
+                        mac, ip, hostname
                     )
 
-                else:
-
-                    connection.execute(
-                        text("""
-                            INSERT INTO mikromanager_known_devices
-                            (
-                                mac,
-                                ip,
-                                hostname,
-                                is_connected
-                            )
-                            VALUES
-                            (
-                                :mac,
-                                :ip,
-                                :hostname,
-                                :is_connected
-                            )
-                        """),
-                        {
-                            "mac": mac,
-                            "ip": ip,
-                            "hostname": hostname,
-                            "is_connected": connected
-                        }
+                elif not connected and bool(previous["is_connected"]):
+                    ajouter_notification(
+                        connection,
+                        "device_disconnected",
+                        "Appareil déconnecté",
+                        f"{hostname} ({ip}) vient de se déconnecter du réseau.",
+                        mac, ip, hostname
                     )
 
         return {
@@ -3289,6 +3387,8 @@ def agent_poll(request: Request):
 
     try:
 
+        liberer_commandes_bloquees()
+
         with engine.begin() as connection:
 
             commands = connection.execute(
@@ -3302,7 +3402,8 @@ def agent_poll(request: Request):
                         FOR UPDATE SKIP LOCKED
                     )
                     UPDATE mikromanager_agent_commands
-                    SET status = 'processing'
+                    SET status = 'processing',
+                        claimed_at = CURRENT_TIMESTAMP
                     WHERE id IN (
                         SELECT id FROM selected
                     )
@@ -3486,7 +3587,6 @@ def agent_result(
 
 @app.get("/mikrotik/agent/poll-ros")
 def agent_poll_ros(request: Request):
-    import json
     import ipaddress
     from fastapi.responses import PlainTextResponse
 
@@ -3494,6 +3594,8 @@ def agent_poll_ros(request: Request):
         return PlainTextResponse("UNAUTHORIZED")
 
     try:
+        liberer_commandes_bloquees()
+
         with engine.begin() as connection:
             command = connection.execute(
                 text("""
@@ -3506,7 +3608,8 @@ def agent_poll_ros(request: Request):
                         FOR UPDATE SKIP LOCKED
                     )
                     UPDATE mikromanager_agent_commands
-                    SET status = 'processing'
+                    SET status = 'processing',
+                        claimed_at = CURRENT_TIMESTAMP
                     WHERE id IN (SELECT id FROM selected)
                     RETURNING id, command_type, command_data
                 """)
@@ -3515,20 +3618,27 @@ def agent_poll_ros(request: Request):
         if not command:
             return PlainTextResponse("EMPTY")
 
-        data = json.loads(command["command_data"])
+        # Validation APRÈS réservation : en cas d'erreur, la commande est
+        # marquée 'failed' au lieu de rester bloquée en 'processing'.
+        try:
+            command_type = command["command_type"]
 
-        command_type = command["command_type"]
-        ip = str(ipaddress.ip_address(data["ip"]))
+            if command_type not in ["block", "unblock", "limit"]:
+                raise ValueError(f"Type invalide : {command_type}")
 
-        download = data.get("download", 0)
-        upload = data.get("upload", 0)
+            data = json.loads(command["command_data"])
+            ip = str(ipaddress.ip_address(data["ip"]))
+            download = int(data.get("download", 0))
+            upload = int(data.get("upload", 0))
 
-        if command_type not in ["block", "unblock", "limit"]:
+        except Exception as e:
+            marquer_commande_echouee(command["id"], repr(e))
             return PlainTextResponse("INVALID")
 
         return PlainTextResponse(
             f'{command["id"]}|{command_type}|{ip}|{download}|{upload}'
         )
 
-    except Exception:
-        return PlainTextResponse("ERROR") 
+    except Exception as e:
+        print("ERREUR POLL-ROS =", repr(e))
+        return PlainTextResponse("ERROR")
