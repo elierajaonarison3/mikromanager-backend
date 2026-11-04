@@ -1656,150 +1656,121 @@ def mikrotik_firewall():
     finally:
         api.close()
 
-
 @app.get("/mikrotik/dashboard")
 def mikrotik_dashboard():
-    api = connexion_mikrotik()
-
-    if api is None:
-        return {
-            "status": "error",
-            "message": "Connexion MikroTik échouée"
-        }
-
     try:
-        resource = api.path(
-            "system",
-            "resource"
-        )
+        with engine.connect() as connection:
+            report = connection.execute(text("""
+                SELECT payload, received_at
+                FROM mikromanager_agent_reports
+                ORDER BY id DESC
+                LIMIT 1
+            """)).mappings().first()
 
-        leases = api.path(
-            "ip",
-            "dhcp-server",
-            "lease"
-        )
-
-        queues = api.path(
-            "queue",
-            "simple"
-        )
-
-        resource_list = list(resource)
-        lease_list = list(leases)
-        queue_list = list(queues)
-
-        if not resource_list:
-
+        if not report:
             return {
                 "status": "error",
-                "message": "Informations système MikroTik introuvables"
+                "message": "Aucun rapport MikroTik Agent disponible"
             }
 
-        system = resource_list[0]
+        payload = report["payload"] or {}
+        received_at = report["received_at"]
 
-        connected = 0
+        system = payload.get("resource") or {}
+        devices = payload.get("devices") or []
+        queues = payload.get("queues") or []
 
-        for lease in lease_list:
+        # Vérifier si mbola mifandray ny Agent
+        age_seconds = (
+            datetime.now() - received_at
+        ).total_seconds()
 
-            if (
-                lease.get("status") == "bound"
-                and lease.get("active-address")
-            ):
-                connected += 1
+        online = 0 <= age_seconds <= 180
 
+        # Fanisana appareils
+        total_devices = len(devices)
+
+        connected = sum(
+            1 for device in devices
+            if device.get("connected") in (True, "true", "yes", 1)
+        )
+
+        # Total traffic
         total_download = 0
         total_upload = 0
 
-        for queue in queue_list:
-
-            bytes_value = queue.get(
-                "bytes",
-                "0/0"
-            )
-
+        for queue in queues:
             try:
-
-                parts = bytes_value.split("/")
+                parts = str(
+                    queue.get("bytes", "0/0")
+                ).split("/")
 
                 if len(parts) == 2:
+                    total_upload += int(parts[0])
+                    total_download += int(parts[1])
 
-                    total_upload += int(
-                        parts[0]
-                    )
-
-                    total_download += int(
-                        parts[1]
-                    )
-
-            except (
-                ValueError,
-                TypeError
-            ):
+            except (ValueError, TypeError):
                 continue
 
-        total_devices = len(
-            lease_list
-        )
+        # Maka valeur-na na snake_case na RouterOS format
+        def get_value(data, *keys, default=0):
+            for key in keys:
+                if data.get(key) is not None:
+                    return data[key]
+            return default
+
+        def to_int(value):
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                return 0
 
         return {
             "status": "success",
+
             "mikrotik": {
-                "online": True,
-                "cpu_load": int(
-                    system.get(
-                        "cpu-load",
-                        0
-                    )
+                "online": online,
+                "cpu_load": to_int(
+                    get_value(system, "cpu-load", "cpu_load")
                 ),
-                "free_memory": int(
-                    system.get(
-                        "free-memory",
-                        0
-                    )
+                "free_memory": to_int(
+                    get_value(system, "free-memory", "free_memory")
                 ),
-                "total_memory": int(
-                    system.get(
-                        "total-memory",
-                        0
-                    )
+                "total_memory": to_int(
+                    get_value(system, "total-memory", "total_memory")
                 ),
-                "uptime": system.get(
-                    "uptime"
-                ),
-                "version": system.get(
-                    "version"
-                ),
-                "board_name": system.get(
-                    "board-name"
-                ),
-                "architecture": system.get(
-                    "architecture-name"
+                "uptime": get_value(system, "uptime", default=""),
+                "version": get_value(system, "version", default=""),
+                "board_name": get_value(system, "board-name", "board_name", default=""),
+                "architecture": get_value(
+                    system,
+                    "architecture-name",
+                    "architecture",
+                    default=""
                 )
             },
+
             "devices": {
                 "total": total_devices,
                 "connected": connected,
-                "inactive": (
-                    total_devices - connected
-                )
+                "inactive": total_devices - connected
             },
+
             "traffic": {
                 "total_download": total_download,
                 "total_upload": total_upload
-            }
+            },
+
+            "source": "mikrotik_agent",
+            "last_update": received_at.isoformat()
         }
 
     except Exception as e:
-
         return {
             "status": "error",
             "message": str(e),
             "type": type(e).__name__
         }
-
-    finally:
-        api.close()
-
 
 def normaliser_domaine(domain: str):
 
