@@ -9,7 +9,7 @@ import hashlib
 import threading
 import time
 from database import engine
-from mikrotik import connexion_mikrotik
+from mikrotik import connexion_mikrotik as _connexion_mikrotik_brut
 from pydantic import BaseModel
 from datetime import datetime
 
@@ -17,6 +17,15 @@ app = FastAPI(
     title="MikroManager API",
     version="1.0.0"
 )
+
+
+def connexion_mikrotik():
+    """Retourne None (au lieu de lever une exception) si le routeur est injoignable."""
+    try:
+        return _connexion_mikrotik_brut()
+    except Exception as e:
+        print("CONNEXION MIKROTIK IMPOSSIBLE =", repr(e))
+        return None
 
 ADMIN_TOKEN = os.getenv("MIKROMANAGER_ADMIN_TOKEN", "")
 
@@ -404,11 +413,11 @@ def verifier_consommation_quotidienne():
                     if len(parts) != 2:
                         continue
 
-                    current_download = int(
+                    current_upload = int(
                         parts[0]
                     )
 
-                    current_upload = int(
+                    current_download = int(
                         parts[1]
                     )
 
@@ -834,6 +843,134 @@ class ServiceBlockRequest(BaseModel):
     domain: str
 
 
+def dernier_rapport_agent():
+    with engine.connect() as db:
+        row = db.execute(text("""
+            SELECT
+                payload,
+                received_at,
+                EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - received_at))
+                    AS age_seconds
+            FROM mikromanager_agent_reports
+            ORDER BY id DESC
+            LIMIT 1
+        """)).mappings().first()
+
+    if not row:
+        return None, None
+
+    payload = row["payload"]
+
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
+    return payload or {}, row
+
+
+def _erreur_pas_de_rapport():
+    return {
+        "status": "error",
+        "message": (
+            "Routeur injoignable et aucun rapport Agent disponible"
+        )
+    }
+
+
+def devices_depuis_agent():
+    payload, row = dernier_rapport_agent()
+
+    if payload is None:
+        return _erreur_pas_de_rapport()
+
+    result = []
+
+    for d in payload.get("devices") or []:
+        if not isinstance(d, dict):
+            continue
+
+        result.append({
+            "ip": d.get("ip"),
+            "mac": d.get("mac"),
+            "hostname": d.get("hostname"),
+            "status": "connected" if d.get("connected") else "inactive",
+            "last_seen": (
+                row["received_at"].isoformat()
+                if row["received_at"] else None
+            )
+        })
+
+    return {
+        "status": "success",
+        "total": len(result),
+        "connected": sum(1 for x in result if x["status"] == "connected"),
+        "devices": result,
+        "source": "mikrotik_agent"
+    }
+
+
+def leases_depuis_agent():
+    payload, row = dernier_rapport_agent()
+
+    if payload is None:
+        return _erreur_pas_de_rapport()
+
+    result = []
+
+    for d in payload.get("devices") or []:
+        if not isinstance(d, dict):
+            continue
+
+        connecte = bool(d.get("connected"))
+
+        result.append({
+            "ip": d.get("ip"),
+            "mac": d.get("mac"),
+            "hostname": d.get("hostname"),
+            "status": "bound" if connecte else "waiting",
+            "active": d.get("ip") if connecte else None,
+            "last_seen": (
+                row["received_at"].isoformat()
+                if row["received_at"] else None
+            )
+        })
+
+    return {
+        "status": "success",
+        "total": len(result),
+        "leases": result,
+        "source": "mikrotik_agent"
+    }
+
+
+def queues_depuis_agent():
+    payload, row = dernier_rapport_agent()
+
+    if payload is None:
+        return _erreur_pas_de_rapport()
+
+    result = []
+
+    for q in payload.get("queues") or []:
+        if not isinstance(q, dict):
+            continue
+
+        result.append({
+            "name": q.get("name"),
+            "target": q.get("target"),
+            "max_limit": q.get("max_limit") or q.get("max-limit"),
+            "bytes": q.get("bytes"),
+            "packets": q.get("packets"),
+            "rate": q.get("rate")
+        })
+
+    return {
+        "status": "success",
+        "total": len(result),
+        "queues": result,
+        "source": "mikrotik_agent"
+    }
+
+
 @app.get("/")
 def accueil():
     return {
@@ -910,10 +1047,7 @@ def mikrotik_devices():
     api = connexion_mikrotik()
 
     if api is None:
-        return {
-            "status": "error",
-            "message": "Connexion MikroTik échouée"
-        }
+        return devices_depuis_agent()
 
     try:
         leases = api.path(
@@ -1011,15 +1145,15 @@ def mikrotik_devices_traffic():
 
             try:
                 parts = str(queue.get("bytes", "0/0")).split("/")
-                download = int(parts[0])
-                upload = int(parts[1])
+                upload = int(parts[0])
+                download = int(parts[1])
             except (ValueError, IndexError, TypeError):
                 download, upload = 0, 0
 
             try:
                 parts = str(queue.get("rate", "0/0")).split("/")
-                rate_download = int(parts[0])
-                rate_upload = int(parts[1])
+                rate_upload = int(parts[0])
+                rate_download = int(parts[1])
             except (ValueError, IndexError, TypeError):
                 rate_download, rate_upload = 0, 0
 
@@ -1162,10 +1296,7 @@ def mikrotik_dhcp_leases():
     api = connexion_mikrotik()
 
     if api is None:
-        return {
-            "status": "error",
-            "message": "Connexion MikroTik échouée"
-        }
+        return leases_depuis_agent()
 
     try:
         leases = api.path(
@@ -1291,10 +1422,7 @@ def mikrotik_queues():
     api = connexion_mikrotik()
 
     if api is None:
-        return {
-            "status": "error",
-            "message": "Connexion MikroTik échouée"
-        }
+        return queues_depuis_agent()
 
     try:
         queues = api.path(
@@ -1687,7 +1815,12 @@ def mikrotik_dashboard():
     try:
         with engine.connect() as connection:
             report = connection.execute(text("""
-                SELECT payload, received_at
+                SELECT
+                    payload,
+                    received_at,
+                    EXTRACT(
+                        EPOCH FROM (CURRENT_TIMESTAMP - received_at)
+                    ) AS age_seconds
                 FROM mikromanager_agent_reports
                 ORDER BY id DESC
                 LIMIT 1
@@ -1707,9 +1840,7 @@ def mikrotik_dashboard():
         queues = payload.get("queues") or []
 
         # Vérifier si mbola mifandray ny Agent
-        age_seconds = (
-            datetime.now() - received_at
-        ).total_seconds()
+        age_seconds = float(report["age_seconds"] or 0)
 
         online = 0 <= age_seconds <= 180
 
@@ -2022,6 +2153,50 @@ def _premiere_liste(payload, *cles):
             return [v for v in valeur if isinstance(v, dict)]
 
     return []
+
+
+def _paire_octets(valeur):
+    """RouterOS : bytes = 'upload/download'."""
+    try:
+        a, b = str(valeur).split("/")[:2]
+        return int(a), int(b)
+    except (ValueError, TypeError):
+        return None
+
+
+def enrichir_avec_queues(devices, payload):
+    """Ajoute le trafic (download/upload) lu dans les queues de l'agent."""
+    queue_by_ip = {}
+
+    for queue in payload.get("queues") or []:
+        if not isinstance(queue, dict):
+            continue
+
+        for item in str(queue.get("target", "")).split(","):
+            ip = item.strip().split("/")[0]
+
+            if ip:
+                queue_by_ip[ip] = queue
+
+    for device in devices:
+        paire = _paire_octets(
+            (queue_by_ip.get(device.get("ip")) or {}).get("bytes")
+        )
+
+        upload, download = paire if paire else (0, 0)
+
+        device["upload_bytes"] = upload
+        device["download_bytes"] = download
+        device["upload_formatted"] = format_octets(upload)
+        device["download_formatted"] = format_octets(download)
+
+        if not device.get("total_bytes"):
+            device["total_bytes"] = upload + download
+            device["total_formatted"] = format_octets(upload + download)
+
+    devices.sort(key=lambda x: x["total_bytes"], reverse=True)
+
+    return devices
 
 
 def obtenir_sites_detectes(payload):
@@ -2814,7 +2989,7 @@ def get_daily_traffic():
                     2
                 )
 
-                item["limit_gb"] = 2
+                item["limit_gb"] = round(DAILY_TRAFFIC_LIMIT / (1024 ** 3), 2)
 
                 item["limit_exceeded"] = (
                     total_bytes >= DAILY_TRAFFIC_LIMIT
@@ -2831,7 +3006,7 @@ def get_daily_traffic():
                 "status": "success",
                 "date": str(today),
                 "limit_bytes": DAILY_TRAFFIC_LIMIT,
-                "limit_gb": 2,
+                "limit_gb": round(DAILY_TRAFFIC_LIMIT / (1024 ** 3), 2),
                 "devices": result
             }
 
@@ -3133,7 +3308,15 @@ def mikrotik_monitoring():
         if isinstance(payload, str):
             payload = json.loads(payload)
 
-        devices = obtenir_sites_detectes(payload)
+        devices = enrichir_avec_queues(
+            obtenir_sites_detectes(payload), payload
+        )
+
+        sites_disponibles = bool(
+            payload.get("dns_cache") or payload.get("dns")
+        ) and bool(
+            payload.get("connections")
+        )
 
         total_sites = sum(
             len(device.get("sites", []))
@@ -3149,6 +3332,7 @@ def mikrotik_monitoring():
             "status": "success",
             "source": "mikrotik_agent",
             "last_update": str(row["received_at"]),
+            "sites_disponibles": sites_disponibles,
             "devices": devices,
             "total_devices": len(devices),
             "total_sites": total_sites,
@@ -3197,6 +3381,120 @@ def ajouter_notification(
             "hostname": hostname
         }
     )
+
+
+def traiter_trafic_quotidien(connection, data):
+    """Met à jour la consommation du jour à partir des queues du rapport agent."""
+    queue_by_ip = {}
+
+    for queue in data.get("queues") or []:
+        if not isinstance(queue, dict):
+            continue
+
+        for item in str(queue.get("target", "")).split(","):
+            ip = item.strip().split("/")[0]
+
+            if ip:
+                queue_by_ip[ip] = queue
+
+    today = datetime.now().date()
+
+    for device in data.get("devices") or []:
+        if not isinstance(device, dict):
+            continue
+
+        mac = str(device.get("mac", "")).strip().upper()
+        ip = device.get("ip")
+
+        if not mac or not ip or ip not in queue_by_ip:
+            continue
+
+        hostname = device.get("hostname") or "Appareil inconnu"
+
+        try:
+            a, b = str(queue_by_ip[ip].get("bytes", "0/0")).split("/")[:2]
+            current_upload, current_download = int(a), int(b)
+        except (ValueError, TypeError):
+            continue
+
+        daily = connection.execute(
+            text("""
+                SELECT id, download_bytes, upload_bytes,
+                       last_download, last_upload, limit_notified
+                FROM mikromanager_daily_traffic
+                WHERE mac = :mac AND traffic_date = :d
+                LIMIT 1
+            """),
+            {"mac": mac, "d": today}
+        ).mappings().first()
+
+        if daily is None:
+            connection.execute(
+                text("""
+                    INSERT INTO mikromanager_daily_traffic
+                        (mac, ip, hostname, traffic_date, download_bytes,
+                         upload_bytes, last_download, last_upload,
+                         limit_notified)
+                    VALUES
+                        (:mac, :ip, :hostname, :d, 0, 0,
+                         :ld, :lu, FALSE)
+                    ON CONFLICT (mac, traffic_date) DO NOTHING
+                """),
+                {
+                    "mac": mac, "ip": ip, "hostname": hostname, "d": today,
+                    "ld": current_download, "lu": current_upload
+                }
+            )
+            continue
+
+        diff_down = current_download - int(daily["last_download"] or 0)
+        diff_up = current_upload - int(daily["last_upload"] or 0)
+
+        # compteur remis à zéro (reboot / reset de la queue)
+        if diff_down < 0:
+            diff_down = current_download
+
+        if diff_up < 0:
+            diff_up = current_upload
+
+        new_download = int(daily["download_bytes"] or 0) + diff_down
+        new_upload = int(daily["upload_bytes"] or 0) + diff_up
+        total = new_download + new_upload
+
+        notified = bool(daily["limit_notified"])
+
+        if total >= DAILY_TRAFFIC_LIMIT and not notified:
+            ajouter_notification(
+                connection,
+                "traffic_limit",
+                "Limite de consommation dépassée",
+                (
+                    f"{hostname} a dépassé "
+                    f"{DAILY_TRAFFIC_LIMIT / (1024 ** 3):g} GB de "
+                    f"consommation aujourd'hui "
+                    f"({total / (1024 ** 3):.2f} GB)."
+                ),
+                mac, ip, hostname
+            )
+            notified = True
+
+        connection.execute(
+            text("""
+                UPDATE mikromanager_daily_traffic
+                SET download_bytes = :dl, upload_bytes = :ul,
+                    last_download = :ld, last_upload = :lu,
+                    limit_notified = :notified,
+                    ip = :ip, hostname = :hostname,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :id
+            """),
+            {
+                "dl": new_download, "ul": new_upload,
+                "ld": current_download, "lu": current_upload,
+                "notified": notified, "ip": ip,
+                "hostname": hostname, "id": daily["id"]
+            }
+        )
 
 
 def liberer_commandes_bloquees(minutes: int = 5):
@@ -3358,6 +3656,8 @@ def agent_report(request: Request, data: dict):
                         f"{hostname} ({ip}) vient de se déconnecter du réseau.",
                         mac, ip, hostname
                     )
+
+            traiter_trafic_quotidien(connection, data)
 
         return {
             "status": "success",
