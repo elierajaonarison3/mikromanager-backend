@@ -2081,6 +2081,39 @@ def nom_site_depuis_domaine(domain):
         if domain.endswith("." + domaine):
             return nom
 
+    # Repli : les caches DNS contiennent souvent des noms canoniques
+    # (youtube-ui.l.google.com, star-mini.c10r.facebook.com, ...).
+    # On compare chaque morceau du nom avec des mots-clés connus.
+    mots_cles = {
+        "youtube": "YouTube",
+        "googlevideo": "YouTube",
+        "ytimg": "YouTube",
+        "facebook": "Facebook",
+        "fbcdn": "Facebook",
+        "instagram": "Instagram",
+        "cdninstagram": "Instagram",
+        "tiktok": "TikTok",
+        "tiktokcdn": "TikTok",
+        "byteoversea": "TikTok",
+        "whatsapp": "WhatsApp",
+        "telegram": "Telegram",
+        "twitter": "X",
+        "netflix": "Netflix",
+        "spotify": "Spotify",
+        "chatgpt": "ChatGPT",
+        "openai": "OpenAI",
+        "anydesk": "AnyDesk",
+        "microsoft": "Microsoft",
+        "office": "Microsoft",
+        "apple": "Apple",
+        "amazon": "Amazon",
+    }
+
+    for morceau in domain.split("."):
+        for cle, nom in mots_cles.items():
+            if morceau == cle or morceau.startswith(cle + "-"):
+                return nom
+
     return None
 
 
@@ -3372,6 +3405,14 @@ def mikrotik_monitoring():
             "last_update": str(row["received_at"]),
             "sites_disponibles": sites_disponibles,
             "sites_last_update": sites_last_update,
+            "sites_debug": {
+                "dns_count": len(payload.get("dns_cache") or []),
+                "connections_count": len(payload.get("connections") or []),
+                "dns_sample": [
+                    str(x.get("name"))
+                    for x in (payload.get("dns_cache") or [])[:5]
+                ]
+            },
             "devices": devices,
             "total_devices": len(devices),
             "total_sites": total_sites,
