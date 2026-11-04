@@ -2002,29 +2002,6 @@ def format_octets(octets):
 
 
 def obtenir_sites_detectes(api):
-
-    leases_path = api.path(
-        "ip",
-        "dhcp-server",
-        "lease"
-    )
-
-    connections_path = api.path(
-        "ip",
-        "firewall",
-        "connection"
-    )
-
-    dns_cache_path = api.path(
-        "ip",
-        "dns",
-        "cache"
-    )
-
-    leases = list(leases_path)
-    connections = list(connections_path)
-    dns_cache = list(dns_cache_path)
-
     appareils = {}
 
     for lease in leases:
@@ -3080,59 +3057,58 @@ def get_blocked_sites():
 @app.get("/mikrotik/monitoring")
 def mikrotik_monitoring():
 
-    api = connexion_mikrotik()
-
-    if api is None:
-        return {
-            "status": "error",
-            "message": "Connexion MikroTik échouée"
-        }
-
     try:
+        with engine.connect() as db:
+            row = db.execute(text("""
+                SELECT payload, received_at
+                FROM mikromanager_agent_reports
+                ORDER BY received_at DESC
+                LIMIT 1
+            """)).mappings().first()
 
-        devices = obtenir_sites_detectes(api)
+        if not row:
+            return {
+                "status": "error",
+                "message": "Aucun rapport MikroTik disponible"
+            }
 
-        total_sites = 0
-        total_bytes = 0
+        payload = row["payload"]
 
-        for device in devices:
+        if isinstance(payload, str):
+            payload = json.loads(payload)
 
-            total_sites += len(
-                device["sites"]
-            )
+        devices = obtenir_sites_detectes(payload)
 
-            total_bytes += device["total_bytes"]
+        total_sites = sum(
+            len(device.get("sites", []))
+            for device in devices
+        )
+
+        total_bytes = sum(
+            device.get("total_bytes", 0)
+            for device in devices
+        )
 
         return {
             "status": "success",
+            "source": "mikrotik_agent",
+            "last_update": str(row["received_at"]),
             "devices": devices,
             "total_devices": len(devices),
             "total_sites": total_sites,
             "total_bytes": total_bytes,
-            "total_formatted": format_octets(
-                total_bytes
-            )
+            "total_formatted": format_octets(total_bytes)
         }
 
     except Exception as e:
-
-        print(
-            "ERREUR MONITORING =",
-            repr(e)
-        )
+        print("ERREUR MONITORING =", repr(e))
 
         return {
             "status": "error",
             "message": str(e),
             "type": type(e).__name__
-        }
-
-    finally:
-
-        try:
-            api.close()
-        except:
-            pass
+        }        
+        
 from fastapi import Request
 from datetime import datetime
 import secrets
