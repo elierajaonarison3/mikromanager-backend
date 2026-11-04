@@ -939,128 +939,77 @@ def mikrotik_devices():
         api.close()
 
 
+
 @app.get("/mikrotik/devices/traffic")
 def mikrotik_devices_traffic():
-    api = connexion_mikrotik()
-
-    if api is None:
-        return {
-            "status": "error",
-            "message": "Connexion MikroTik échouée"
-        }
-
     try:
-        leases = api.path(
-            "ip",
-            "dhcp-server",
-            "lease"
-        )
+        with engine.connect() as connection:
+            report = connection.execute(text("""
+                SELECT payload, received_at
+                FROM mikromanager_agent_reports
+                ORDER BY id DESC
+                LIMIT 1
+            """)).mappings().first()
 
-        queues = api.path(
-            "queue",
-            "simple"
-        )
+            if not report:
+                return {
+                    "status": "error",
+                    "message": "Aucun rapport Agent disponible"
+                }
 
-        lease_list = list(leases)
-        queue_list = list(queues)
+            payload = report["payload"]
+            received_at = report["received_at"]
 
+        devices = payload.get("devices", [])
+        queues = payload.get("queues", [])
         queue_by_ip = {}
 
-        for queue in queue_list:
-
-            target = queue.get(
-                "target",
-                ""
-            )
-
-            if target:
-                ip = target.split("/")[0]
-                queue_by_ip[ip] = queue
+        for queue in queues:
+            target = str(queue.get("target", ""))
+            for item in target.split(","):
+                ip = item.strip().split("/")[0]
+                if ip:
+                    queue_by_ip[ip] = queue
 
         result = []
 
-        for lease in lease_list:
-
-            ip = lease.get("address")
-
+        for device in devices:
+            ip = device.get("ip")
             if not ip:
                 continue
 
-            status = lease.get("status")
-            active_address = lease.get("active-address")
+            queue = queue_by_ip.get(ip, {})
 
-            if status == "bound" and active_address:
-                device_status = "connected"
-            else:
-                device_status = "inactive"
+            try:
+                parts = str(queue.get("bytes", "0/0")).split("/")
+                download = int(parts[0])
+                upload = int(parts[1])
+            except (ValueError, IndexError, TypeError):
+                download, upload = 0, 0
 
-            queue = queue_by_ip.get(ip)
-
-            download = 0
-            upload = 0
-            rate_download = 0
-            rate_upload = 0
-
-            if queue:
-
-                bytes_value = queue.get(
-                    "bytes",
-                    "0/0"
-                )
-
-                rate_value = queue.get(
-                    "rate",
-                    "0/0"
-                )
-
-                try:
-                    byte_parts = bytes_value.split("/")
-
-                    download = int(
-                        byte_parts[0]
-                    )
-
-                    upload = int(
-                        byte_parts[1]
-                    )
-
-                except Exception:
-
-                    download = 0
-                    upload = 0
-
-                try:
-                    rate_parts = rate_value.split("/")
-
-                    rate_download = int(
-                        rate_parts[0]
-                    )
-
-                    rate_upload = int(
-                        rate_parts[1]
-                    )
-
-                except Exception:
-
-                    rate_download = 0
-                    rate_upload = 0
+            try:
+                parts = str(queue.get("rate", "0/0")).split("/")
+                rate_download = int(parts[0])
+                rate_upload = int(parts[1])
+            except (ValueError, IndexError, TypeError):
+                rate_download, rate_upload = 0, 0
 
             result.append({
                 "ip": ip,
-                "mac": lease.get("mac-address"),
-                "hostname": lease.get("host-name"),
+                "mac": device.get("mac"),
+                "hostname": device.get("hostname"),
                 "interface": None,
-                "status": device_status,
+                "status": "connected" if device.get("connected") else "inactive",
                 "download": download,
                 "upload": upload,
                 "rate_download": rate_download,
                 "rate_upload": rate_upload,
-                "last_seen": lease.get("last-seen")
+                "last_seen": received_at.isoformat() if received_at else None,
+                "max_limit": queue.get("max_limit")
             })
 
         connected_devices = [
-            device
-            for device in result
+            device for device in result
             if device["status"] == "connected"
         ]
 
@@ -1068,21 +1017,18 @@ def mikrotik_devices_traffic():
             "status": "success",
             "total": len(result),
             "connected": len(connected_devices),
-            "devices": result
+            "devices": result,
+            "resource": payload.get("resource", {}),
+            "source": "mikrotik_agent",
+            "last_update": received_at.isoformat() if received_at else None
         }
 
     except Exception as e:
-
         return {
             "status": "error",
             "message": str(e),
             "type": type(e).__name__
         }
-
-    finally:
-        api.close()
-
-
 @app.post("/mikrotik/devices/auto-queues")
 def create_auto_queues():
     api = connexion_mikrotik()
