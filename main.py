@@ -143,6 +143,13 @@ def initialiser_tables_notifications():
                 received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS mikromanager_agent_sites (
+                id SERIAL PRIMARY KEY,
+                payload JSONB NOT NULL,
+                received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
  
 def verifier_connexions_appareils():
     api = None
@@ -1898,7 +1905,7 @@ def mikrotik_dashboard():
                 ),
                 "uptime": get_value(system, "uptime", default=""),
                 "version": get_value(system, "version", default=""),
-                "board_name": get_value(system, "board-name", "board_name", default=""),
+                "board_name": get_value(system, "board-name", "board_name", "board", default=""),
                 "architecture": get_value(
                     system,
                     "architecture-name",
@@ -3308,6 +3315,37 @@ def mikrotik_monitoring():
         if isinstance(payload, str):
             payload = json.loads(payload)
 
+        sites_last_update = None
+
+        try:
+            with engine.connect() as db:
+                sites_row = db.execute(text("""
+                    SELECT
+                        payload,
+                        received_at,
+                        EXTRACT(
+                            EPOCH FROM (CURRENT_TIMESTAMP - received_at)
+                        ) AS age_seconds
+                    FROM mikromanager_agent_sites
+                    ORDER BY id DESC
+                    LIMIT 1
+                """)).mappings().first()
+        except Exception as e:
+            print("INFO sites non disponibles =", repr(e))
+            sites_row = None
+
+        # on n'utilise le détail que s'il a moins de 15 minutes
+        if sites_row and float(sites_row["age_seconds"] or 0) <= 900:
+            detail = sites_row["payload"]
+
+            if isinstance(detail, str):
+                detail = json.loads(detail)
+
+            payload = dict(payload)
+            payload["dns_cache"] = (detail or {}).get("dns_cache") or []
+            payload["connections"] = (detail or {}).get("connections") or []
+            sites_last_update = str(sites_row["received_at"])
+
         devices = enrichir_avec_queues(
             obtenir_sites_detectes(payload), payload
         )
@@ -3333,6 +3371,7 @@ def mikrotik_monitoring():
             "source": "mikrotik_agent",
             "last_update": str(row["received_at"]),
             "sites_disponibles": sites_disponibles,
+            "sites_last_update": sites_last_update,
             "devices": devices,
             "total_devices": len(devices),
             "total_sites": total_sites,
@@ -3674,6 +3713,68 @@ def agent_report(request: Request, data: dict):
             "message": str(e),
             "type": type(e).__name__
         }
+
+@app.post("/mikrotik/agent/sites-report")
+def agent_sites_report(request: Request, data: dict):
+    """Reçoit dns_cache + connections (rapport léger séparé) de l'agent."""
+
+    if not verifier_agent(request):
+        return {
+            "status": "error",
+            "message": "Unauthorized"
+        }
+
+    try:
+        dns_cache = [
+            x for x in (data.get("dns_cache") or [])
+            if isinstance(x, dict)
+        ][:500]
+
+        connections = [
+            x for x in (data.get("connections") or [])
+            if isinstance(x, dict)
+        ][:500]
+
+        with engine.begin() as connection:
+            connection.execute(text("""
+                CREATE TABLE IF NOT EXISTS mikromanager_agent_sites (
+                    id SERIAL PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+
+            connection.execute(
+                text("""
+                    INSERT INTO mikromanager_agent_sites (payload)
+                    VALUES (CAST(:payload AS JSONB))
+                """),
+                {
+                    "payload": json.dumps({
+                        "dns_cache": dns_cache,
+                        "connections": connections
+                    })
+                }
+            )
+
+            connection.execute(text("""
+                DELETE FROM mikromanager_agent_sites
+                WHERE received_at < CURRENT_TIMESTAMP - INTERVAL '1 day'
+            """))
+
+        return {
+            "status": "success",
+            "dns_received": len(dns_cache),
+            "connections_received": len(connections)
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "type": type(e).__name__
+        }
+
 
 @app.get("/mikrotik/agent/poll")
 def agent_poll(request: Request):
