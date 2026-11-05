@@ -2143,6 +2143,27 @@ def nom_site_depuis_domaine(domain):
     return None
 
 
+def domaine_principal(domain):
+    """claude.ai, xhamster.com, bbc.co.uk ... (domaine enregistrable)."""
+    domain = nettoyer_nom_site(domain)
+
+    if not domain:
+        return None
+
+    labels = [x for x in domain.split(".") if x]
+
+    if len(labels) <= 2:
+        return ".".join(labels)
+
+    if (
+        len(labels[-1]) == 2
+        and labels[-2] in ("co", "com", "org", "net", "gov", "edu", "ac")
+    ):
+        return ".".join(labels[-3:])
+
+    return ".".join(labels[-2:])
+
+
 def est_domaine_technique(domain):
     if not domain:
         return True
@@ -2173,6 +2194,25 @@ def est_domaine_technique(domain):
         "safebrowsing.googleapis.com",
 
         "update.googleapis.com",
+
+        "amazonaws.com",
+        "cloudfront.net",
+        "fastly.net",
+        "edgekey.net",
+        "edgesuite.net",
+        "akamaized.net",
+        "azureedge.net",
+        "trafficmanager.net",
+        "windowsupdate.com",
+        "msedge.net",
+        "gvt1.com",
+        "gvt2.com",
+        "1e100.net",
+        "googletagmanager.com",
+        "google-analytics.com",
+        "googlesyndication.com",
+        "mikrotik.com",
+        "ntp.org",
     ]
 
     for domaine in domaines_techniques:
@@ -2433,11 +2473,20 @@ def obtenir_sites_detectes(payload):
             if not domain:
                 continue
 
+            if "." not in domain:
+                continue
+
+            if domain.endswith(
+                (".arpa", ".local", ".lan", ".localdomain", ".internal")
+            ):
+                continue
+
             if est_domaine_technique(domain):
                 continue
 
-            nom = nom_site_depuis_domaine(
-                domain
+            nom = (
+                nom_site_depuis_domaine(domain)
+                or domaine_principal(domain)
             )
 
             if not nom:
@@ -2450,10 +2499,14 @@ def obtenir_sites_detectes(payload):
         if not domaines_valides:
             continue
 
+        sites_distincts = {nom for nom, _ in domaines_valides}
+
         consommation_par_site = (
             total_connection
-            / len(domaines_valides)
+            / len(sites_distincts)
         )
+
+        deja_compte = set()
 
         for nom, domain in domaines_valides:
 
@@ -2469,9 +2522,11 @@ def obtenir_sites_detectes(payload):
                     domain
                 )
 
-            appareils[src_ip]["sites"][nom]["bytes"] += (
-                consommation_par_site
-            )
+            if nom not in deja_compte:
+                appareils[src_ip]["sites"][nom]["bytes"] += (
+                    consommation_par_site
+                )
+                deja_compte.add(nom)
 
     result = []
 
@@ -4104,7 +4159,6 @@ def agent_poll_ros(request: Request):
             ip = str(ipaddress.ip_address(data["ip"]))
             download = int(data.get("download", 0))
             upload = int(data.get("upload", 0))
-
         except Exception as e:
             marquer_commande_echouee(command["id"], repr(e))
             return PlainTextResponse("INVALID")
